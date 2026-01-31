@@ -1,0 +1,718 @@
+package main
+
+import (
+	"bytes"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gorilla/websocket"
+)
+
+// --- Test Helpers ---
+
+// createTestImage creates a simple test image and returns it as PNG bytes
+func createTestImage(width, height int) []byte {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	// Fill with red color
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+// createTestPDF creates a minimal valid PDF
+func createTestPDF() []byte {
+	return []byte(`%PDF-1.4
+1 0 obj
+<<
+/Type /Catalog
+/Pages 2 0 R
+>>
+endobj
+2 0 obj
+<<
+/Type /Pages
+/Kids [3 0 R]
+/Count 1
+>>
+endobj
+3 0 obj
+<<
+/Type /Page
+/Parent 2 0 R
+/MediaBox [0 0 612 792]
+>>
+endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000058 00000 n
+0000000115 00000 n
+trailer
+<<
+/Size 4
+/Root 1 0 R
+>>
+startxref
+196
+%%EOF`)
+}
+
+// --- Unit Tests ---
+
+func TestExtractDataURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		dataURL     string
+		wantData    string
+		wantMime    string
+		wantErr     bool
+	}{
+		{
+			name:        "Valid JPEG data URL",
+			dataURL:     "data:image/jpeg;base64,/9j/4AAQSkZJRg==",
+			wantData:    "/9j/4AAQSkZJRg==",
+			wantMime:    "image/jpeg",
+			wantErr:     false,
+		},
+		{
+			name:        "Valid PNG data URL",
+			dataURL:     "data:image/png;base64,iVBORw0KGgo=",
+			wantData:    "iVBORw0KGgo=",
+			wantMime:    "image/png",
+			wantErr:     false,
+		},
+		{
+			name:        "Default to JPEG if no mime type",
+			dataURL:     "data:;base64,abc123",
+			wantData:    "abc123",
+			wantMime:    "image/jpeg",
+			wantErr:     false,
+		},
+		{
+			name:        "Invalid data URL - no comma",
+			dataURL:     "data:image/jpeg;base64",
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, mime, err := extractDataURL(tt.dataURL)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("extractDataURL() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				if data != tt.wantData {
+					t.Errorf("extractDataURL() data = %v, want %v", data, tt.wantData)
+				}
+				if mime != tt.wantMime {
+					t.Errorf("extractDataURL() mime = %v, want %v", mime, tt.wantMime)
+				}
+			}
+		})
+	}
+}
+
+func TestFetchImageToBase64_DataURL(t *testing.T) {
+	// Create a test image
+	imgBytes := createTestImage(10, 10)
+	base64Img := base64.StdEncoding.EncodeToString(imgBytes)
+	dataURL := fmt.Sprintf("data:image/png;base64,%s", base64Img)
+
+	data, mime, err := fetchImageToBase64(dataURL)
+	if err != nil {
+		t.Fatalf("fetchImageToBase64() error = %v", err)
+	}
+
+	if mime != "image/png" {
+		t.Errorf("fetchImageToBase64() mime = %v, want image/png", mime)
+	}
+
+	if data != base64Img {
+		t.Errorf("fetchImageToBase64() data length = %d, want %d", len(data), len(base64Img))
+	}
+}
+
+func TestFetchImageToBase64_HTTPUrl(t *testing.T) {
+	// Create test HTTP server
+	imgBytes := createTestImage(10, 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(imgBytes)
+	}))
+	defer server.Close()
+
+	// Override proxyClient to use test server directly (no proxy)
+	proxyClient = server.Client()
+
+	data, mime, err := fetchImageToBase64(server.URL)
+	if err != nil {
+		t.Fatalf("fetchImageToBase64() error = %v", err)
+	}
+
+	if mime != "image/png" {
+		t.Errorf("fetchImageToBase64() mime = %v, want image/png", mime)
+	}
+
+	// Decode and verify
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		t.Fatalf("base64 decode error = %v", err)
+	}
+
+	if len(decoded) != len(imgBytes) {
+		t.Errorf("decoded length = %d, want %d", len(decoded), len(imgBytes))
+	}
+}
+
+func TestFetchImageToBase64_SizeLimit(t *testing.T) {
+	// Create image larger than maxFileSize
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", maxFileSize+1))
+		w.Write([]byte("fake image data"))
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	_, _, err := fetchImageToBase64(server.URL)
+	if err == nil {
+		t.Error("fetchImageToBase64() should return error for oversized file")
+	}
+
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("fetchImageToBase64() error = %v, want 'too large'", err)
+	}
+}
+
+func TestFetchPDFToBase64(t *testing.T) {
+	pdfBytes := createTestPDF()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Write(pdfBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	data, err := fetchPDFToBase64(server.URL)
+	if err != nil {
+		t.Fatalf("fetchPDFToBase64() error = %v", err)
+	}
+
+	// Decode and verify PDF magic bytes
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		t.Fatalf("base64 decode error = %v", err)
+	}
+
+	if !bytes.HasPrefix(decoded, []byte("%PDF")) {
+		t.Error("fetchPDFToBase64() result doesn't start with PDF magic bytes")
+	}
+}
+
+func TestFetchPDFToBase64_InvalidPDF(t *testing.T) {
+	// Server returns non-PDF data
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("This is not a PDF"))
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	_, err := fetchPDFToBase64(server.URL)
+	if err == nil {
+		t.Error("fetchPDFToBase64() should return error for invalid PDF")
+	}
+
+	if !strings.Contains(err.Error(), "not a valid PDF") {
+		t.Errorf("fetchPDFToBase64() error = %v, want 'not a valid PDF'", err)
+	}
+}
+
+func TestProcessContentArray_ImageURL(t *testing.T) {
+	// Setup test image server
+	imgBytes := createTestImage(10, 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Write(imgBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	// Create test message with image_url
+	msg := map[string]interface{}{
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "What's in this image?",
+			},
+			map[string]interface{}{
+				"type": "image_url",
+				"image_url": map[string]interface{}{
+					"url": server.URL,
+				},
+			},
+		},
+	}
+
+	modified := processContentArray(msg, "content")
+	if !modified {
+		t.Error("processContentArray() should return true when content is modified")
+	}
+
+	// Verify conversion to inline_data
+	content := msg["content"].([]interface{})
+	if len(content) != 2 {
+		t.Errorf("content length = %d, want 2", len(content))
+	}
+
+	imgItem := content[1].(map[string]interface{})
+	if _, ok := imgItem["type"]; ok {
+		t.Error("'type' field should be removed")
+	}
+	if _, ok := imgItem["image_url"]; ok {
+		t.Error("'image_url' field should be removed")
+	}
+
+	inlineData, ok := imgItem["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatal("'inline_data' field not found")
+	}
+
+	if mimeType := inlineData["mime_type"]; mimeType != "image/png" {
+		t.Errorf("mime_type = %v, want image/png", mimeType)
+	}
+
+	if _, ok := inlineData["data"].(string); !ok {
+		t.Error("'data' field should be a string")
+	}
+}
+
+func TestProcessContentArray_StringContent(t *testing.T) {
+	// String content should not be modified
+	msg := map[string]interface{}{
+		"content": "This is plain text",
+	}
+
+	modified := processContentArray(msg, "content")
+	if modified {
+		t.Error("processContentArray() should return false for string content")
+	}
+}
+
+func TestConvertMultimodalContent_OpenAIFormat(t *testing.T) {
+	// Setup test image server
+	imgBytes := createTestImage(10, 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(imgBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	// Create OpenAI format request
+	request := map[string]interface{}{
+		"model": "gpt-4-vision",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "text",
+						"text": "Describe this image",
+					},
+					map[string]interface{}{
+						"type": "image_url",
+						"image_url": map[string]interface{}{
+							"url": server.URL,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bodyBytes, _ := json.Marshal(request)
+	result, err := convertMultimodalContent(bodyBytes)
+	if err != nil {
+		t.Fatalf("convertMultimodalContent() error = %v", err)
+	}
+
+	// Parse result
+	var converted map[string]interface{}
+	if err := json.Unmarshal(result, &converted); err != nil {
+		t.Fatalf("json.Unmarshal() error = %v", err)
+	}
+
+	// Verify conversion
+	messages := converted["messages"].([]interface{})
+	message := messages[0].(map[string]interface{})
+	content := message["content"].([]interface{})
+	imgItem := content[1].(map[string]interface{})
+
+	if _, ok := imgItem["inline_data"]; !ok {
+		t.Error("image should be converted to inline_data format")
+	}
+}
+
+func TestMapSizeToAspectRatio(t *testing.T) {
+	tests := []struct {
+		size string
+		want string
+	}{
+		{"1024x1024", "1:1"},
+		{"512x512", "1:1"},
+		{"256x256", "1:1"},
+		{"1792x1024", "16:9"},
+		{"1024x1792", "9:16"},
+		{"unknown", "1:1"}, // default
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.size, func(t *testing.T) {
+			got := mapSizeToAspectRatio(tt.size)
+			if got != tt.want {
+				t.Errorf("mapSizeToAspectRatio(%v) = %v, want %v", tt.size, got, tt.want)
+			}
+		})
+	}
+}
+
+// --- Integration Tests ---
+
+func TestHandleImageGeneration_Integration(t *testing.T) {
+	// Initialize connection pool and pending requests
+	globalPool = &ConnectionPool{
+		Users: make(map[string]*UserConnections),
+	}
+
+	// Create test WebSocket server
+	wsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upgrader := websocket.Upgrader{
+			CheckOrigin: func(r *http.Request) bool { return true },
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("WebSocket upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// Read request
+		var msg WSMessage
+		if err := conn.ReadJSON(&msg); err != nil {
+			t.Errorf("ReadJSON error: %v", err)
+			return
+		}
+
+		// Send mock response
+		response := WSMessage{
+			ID:   msg.ID,
+			Type: "http_response",
+			Payload: map[string]interface{}{
+				"status": float64(200),
+				"body": `{
+					"predictions": [{
+						"bytesBase64Encoded": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+						"mimeType": "image/png"
+					}]
+				}`,
+			},
+		}
+		conn.WriteJSON(response)
+	}))
+	defer wsServer.Close()
+
+	// Connect WebSocket client to test server
+	wsURL := "ws" + strings.TrimPrefix(wsServer.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("WebSocket dial error: %v", err)
+	}
+
+	// Add connection to pool
+	globalPool.AddConnection("user-1", conn)
+
+	// Start goroutine to handle WebSocket messages
+	go func() {
+		for {
+			var msg WSMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return
+			}
+
+			// Forward to pending request
+			if ch, ok := pendingRequests.Load(msg.ID); ok {
+				ch.(chan *WSMessage) <- &msg
+			}
+		}
+	}()
+
+	// Create test HTTP request
+	reqBody := map[string]interface{}{
+		"prompt":          "A cute cat",
+		"n":               1,
+		"size":            "1024x1024",
+		"response_format": "url",
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+
+	req := httptest.NewRequest("POST", "/v1/images/generations", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+
+	// Call handler
+	handleImageGeneration(w, req)
+
+	// Verify response
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatalf("json.Decode error: %v", err)
+	}
+
+	// Verify DALL-E format
+	if _, ok := result["created"]; !ok {
+		t.Error("response should have 'created' field")
+	}
+
+	data, ok := result["data"].([]interface{})
+	if !ok || len(data) == 0 {
+		t.Error("response should have 'data' array with at least one item")
+	}
+
+	item := data[0].(map[string]interface{})
+	if _, ok := item["url"]; !ok {
+		t.Error("data item should have 'url' field")
+	}
+}
+
+func TestProcessMultimodalPart_FileData(t *testing.T) {
+	// Setup test server
+	imgBytes := createTestImage(10, 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(imgBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	// Test part with file_data
+	part := map[string]interface{}{
+		"file_data": map[string]interface{}{
+			"file_uri": server.URL,
+		},
+	}
+
+	modified := processMultimodalPart(part)
+	if !modified {
+		t.Error("processMultimodalPart() should return true when part is modified")
+	}
+
+	// Verify conversion
+	if _, ok := part["file_data"]; ok {
+		t.Error("'file_data' should be removed")
+	}
+
+	inlineData, ok := part["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatal("'inline_data' field not found")
+	}
+
+	if _, ok := inlineData["data"].(string); !ok {
+		t.Error("'data' field should be a string")
+	}
+}
+
+func TestProcessMultimodalPart_AlreadyInlineData(t *testing.T) {
+	// Part already has inline_data
+	part := map[string]interface{}{
+		"inline_data": map[string]interface{}{
+			"mime_type": "image/jpeg",
+			"data":      "base64data",
+		},
+	}
+
+	modified := processMultimodalPart(part)
+	if modified {
+		t.Error("processMultimodalPart() should return false when inline_data already exists")
+	}
+}
+
+// --- Benchmark Tests ---
+
+func BenchmarkExtractDataURL(b *testing.B) {
+	dataURL := "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/2wBDAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAARCAABAAEDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAr/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAAAAX/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCKAAA="
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		extractDataURL(dataURL)
+	}
+}
+
+func BenchmarkConvertMultimodalContent(b *testing.B) {
+	// Create test image server
+	imgBytes := createTestImage(10, 10)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(imgBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	request := map[string]interface{}{
+		"model": "gpt-4-vision",
+		"messages": []interface{}{
+			map[string]interface{}{
+				"role": "user",
+				"content": []interface{}{
+					map[string]interface{}{
+						"type": "image_url",
+						"image_url": map[string]interface{}{
+							"url": server.URL,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	bodyBytes, _ := json.Marshal(request)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		convertMultimodalContent(bodyBytes)
+	}
+}
+
+// --- Error Handling Tests ---
+
+func TestFetchImageToBase64_InvalidURL(t *testing.T) {
+	_, _, err := fetchImageToBase64("not a valid url")
+	if err == nil {
+		t.Error("fetchImageToBase64() should return error for invalid URL")
+	}
+}
+
+func TestFetchImageToBase64_404(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	_, _, err := fetchImageToBase64(server.URL)
+	if err == nil {
+		t.Error("fetchImageToBase64() should return error for 404")
+	}
+}
+
+func TestFetchImageToBase64_InvalidImage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("This is not an image"))
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	_, _, err := fetchImageToBase64(server.URL)
+	if err == nil {
+		t.Error("fetchImageToBase64() should return error for invalid image data")
+	}
+
+	if !strings.Contains(err.Error(), "invalid image") {
+		t.Errorf("fetchImageToBase64() error = %v, want 'invalid image'", err)
+	}
+}
+
+func TestConvertMultimodalContent_InvalidJSON(t *testing.T) {
+	invalidJSON := []byte("not valid json")
+
+	result, err := convertMultimodalContent(invalidJSON)
+	if err != nil {
+		t.Errorf("convertMultimodalContent() should not error on invalid JSON, got %v", err)
+	}
+
+	// Should return original bytes
+	if !bytes.Equal(result, invalidJSON) {
+		t.Error("convertMultimodalContent() should return original bytes for invalid JSON")
+	}
+}
+
+func TestProcessContentArray_PDFDocument(t *testing.T) {
+	// Setup test PDF server
+	pdfBytes := createTestPDF()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Write(pdfBytes)
+	}))
+	defer server.Close()
+
+	proxyClient = server.Client()
+
+	// Create test message with document
+	msg := map[string]interface{}{
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "text",
+				"text": "Summarize this document",
+			},
+			map[string]interface{}{
+				"type": "pdf",
+				"document_url": server.URL,
+			},
+		},
+	}
+
+	modified := processContentArray(msg, "content")
+	if !modified {
+		t.Error("processContentArray() should return true when PDF is processed")
+	}
+
+	// Verify conversion to inline_data
+	content := msg["content"].([]interface{})
+	pdfItem := content[1].(map[string]interface{})
+
+	inlineData, ok := pdfItem["inline_data"].(map[string]interface{})
+	if !ok {
+		t.Fatal("'inline_data' field not found")
+	}
+
+	if mimeType := inlineData["mime_type"]; mimeType != "application/pdf" {
+		t.Errorf("mime_type = %v, want application/pdf", mimeType)
+	}
+
+	// Verify it's valid base64
+	data := inlineData["data"].(string)
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		t.Fatalf("base64 decode error: %v", err)
+	}
+
+	if !bytes.HasPrefix(decoded, []byte("%PDF")) {
+		t.Error("decoded PDF should start with magic bytes")
+	}
+}
